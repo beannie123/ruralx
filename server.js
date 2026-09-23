@@ -14,6 +14,8 @@ import { fileURLToPath } from "url";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
+app.set("trust proxy", 1);
+
 const PORT = Number(process.env.PORT || 3000);
 const db = new Database(path.join(__dirname, "ruralx.db"));
 db.pragma("journal_mode = WAL");
@@ -248,10 +250,21 @@ app.post("/api/auth/signup", authLimiter, csrf, async (req,res) => {
   const pinHash = await bcrypt.hash(pin, 12);
   const info = db.prepare("INSERT INTO users(name,mobile,email,password_hash,security_pin_hash,role) VALUES(?,?,?,?,?,?)")
     .run(name,mobile,email||null,passwordHash,pinHash,"citizen");
-  sendOtp(info.lastInsertRowid, "signup");
-  req.session.pendingUserId = Number(info.lastInsertRowid);
-  req.session.pendingPurpose = "signup";
-  res.status(201).json({ok:true, message:"OTP generated. In development it is printed in the server console."});
+ sendOtp(info.lastInsertRowid, "signup");
+
+req.session.pendingUserId = Number(info.lastInsertRowid);
+req.session.pendingPurpose = "signup";
+
+req.session.save(err => {
+  if (err) {
+    console.error("Session save error:", err);
+    return res.status(500).json({error:"Could not initialize OTP session"});
+  }
+
+  res.status(201).json({
+    ok:true,
+    message:"OTP generated. In development it is printed in the server console."
+  });
 });
 
 app.post("/api/auth/login", authLimiter, csrf, async (req,res) => {
@@ -261,11 +274,21 @@ app.post("/api/auth/login", authLimiter, csrf, async (req,res) => {
   if (!user || !(await bcrypt.compare(parsed.data.password, user.password_hash)))
     return res.status(401).json({error:"Invalid mobile number or password"});
   sendOtp(user.id, "login");
-  req.session.pendingUserId = user.id;
-  req.session.pendingPurpose = "login";
-  res.json({ok:true, message:"OTP required"});
-});
 
+req.session.pendingUserId = user.id;
+req.session.pendingPurpose = "login";
+
+req.session.save(err => {
+  if (err) {
+    console.error("Session save error:", err);
+    return res.status(500).json({error:"Could not initialize OTP session"});
+  }
+
+  res.json({
+    ok:true,
+    message:"OTP required"
+  });
+});
 app.post("/api/auth/verify-otp", authLimiter, csrf, async (req,res) => {
   const userId = Number(req.session.pendingUserId);
   const purpose = req.session.pendingPurpose;
