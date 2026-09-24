@@ -14,8 +14,6 @@ import { fileURLToPath } from "url";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
-app.set("trust proxy", 1);
-
 const PORT = Number(process.env.PORT || 3000);
 const db = new Database(path.join(__dirname, "ruralx.db"));
 db.pragma("journal_mode = WAL");
@@ -200,41 +198,22 @@ const loginSchema = z.object({
 
 app.use("/api", apiLimiter);
 
-// CSRF protection using a double-submit cookie.
-// This avoids relying on the Render SQLite session store for CSRF tokens.
-app.get("/api/csrf", (req, res) => {
-  let token = req.cookies.ruralx_csrf;
-
-  if (!token) {
-    token = crypto.randomBytes(32).toString("hex");
-
-    res.cookie("ruralx_csrf", token, {
-      httpOnly: false,
-      sameSite: "lax",
-      secure: process.env.NODE_ENV === "production",
-      maxAge: 60 * 60 * 1000,
-      path: "/"
-    });
+app.get("/api/csrf", (req,res,next) => {
+  // Keep one CSRF token for the lifetime of the browser session.
+  // Do not regenerate it on every GET: multiple localhost tabs share the
+  // same session cookie, and regenerating it in one tab invalidates another.
+  if (!req.session.csrf) {
+    req.session.csrf = crypto.randomBytes(24).toString("hex");
   }
-
-  res.set("Cache-Control", "no-store");
-  res.json({ token });
+  req.session.save(err => {
+    if (err) return next(err);
+    res.set("Cache-Control", "no-store");
+    res.json({token:req.session.csrf});
+  });
 });
-
-function csrf(req, res, next) {
-  const cookieToken = req.cookies.ruralx_csrf;
-  const headerToken = req.get("x-csrf-token");
-
-  if (
-    !cookieToken ||
-    !headerToken ||
-    cookieToken !== headerToken
-  ) {
-    return res.status(403).json({
-      error: "CSRF validation failed"
-    });
-  }
-
+function csrf(req,res,next) {
+  if (!req.session.csrf || req.get("x-csrf-token") !== req.session.csrf)
+    return res.status(403).json({error:"CSRF validation failed"});
   next();
 }
 
@@ -250,21 +229,10 @@ app.post("/api/auth/signup", authLimiter, csrf, async (req,res) => {
   const pinHash = await bcrypt.hash(pin, 12);
   const info = db.prepare("INSERT INTO users(name,mobile,email,password_hash,security_pin_hash,role) VALUES(?,?,?,?,?,?)")
     .run(name,mobile,email||null,passwordHash,pinHash,"citizen");
- sendOtp(info.lastInsertRowid, "signup");
-
-req.session.pendingUserId = Number(info.lastInsertRowid);
-req.session.pendingPurpose = "signup";
-
-req.session.save(err => {
-  if (err) {
-    console.error("Session save error:", err);
-    return res.status(500).json({error:"Could not initialize OTP session"});
-  }
-
-  res.status(201).json({
-    ok:true,
-    message:"OTP generated. In development it is printed in the server console."
-  });
+  sendOtp(info.lastInsertRowid, "signup");
+  req.session.pendingUserId = Number(info.lastInsertRowid);
+  req.session.pendingPurpose = "signup";
+  res.status(201).json({ok:true, message:"OTP generated. In development it is printed in the server console."});
 });
 
 app.post("/api/auth/login", authLimiter, csrf, async (req,res) => {
@@ -274,21 +242,11 @@ app.post("/api/auth/login", authLimiter, csrf, async (req,res) => {
   if (!user || !(await bcrypt.compare(parsed.data.password, user.password_hash)))
     return res.status(401).json({error:"Invalid mobile number or password"});
   sendOtp(user.id, "login");
-
-req.session.pendingUserId = user.id;
-req.session.pendingPurpose = "login";
-
-req.session.save(err => {
-  if (err) {
-    console.error("Session save error:", err);
-    return res.status(500).json({error:"Could not initialize OTP session"});
-  }
-
-  res.json({
-    ok:true,
-    message:"OTP required"
-  });
+  req.session.pendingUserId = user.id;
+  req.session.pendingPurpose = "login";
+  res.json({ok:true, message:"OTP required"});
 });
+
 app.post("/api/auth/verify-otp", authLimiter, csrf, async (req,res) => {
   const userId = Number(req.session.pendingUserId);
   const purpose = req.session.pendingPurpose;
